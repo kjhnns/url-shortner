@@ -1,4 +1,4 @@
-# gojoe.run seed links — slug<space>url, one per line.
+# gojoe.run seed links - slug<space>url, one per line.
 #
 # Lines starting with "#" and blank lines are ignored.
 # After the API is deployed (see DEPLOY.md), create these by running shortcli

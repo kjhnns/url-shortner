@@ -1,4 +1,4 @@
-# DEPLOY.md — gojoe.run runbook (Hetzner VPS, Debian)
+# DEPLOY.md - gojoe.run runbook (Hetzner VPS, Debian)
 
 Operational runbook for deploying / redeploying the URL shortener on the Hetzner
 box that serves `gojoe.run`. Written to be executed step by step by an operator
@@ -17,7 +17,7 @@ Canonical paths and names (must stay consistent with `deploy/`):
 | listen port | `8080` (Caddy reverse-proxies `gojoe.run` -> `127.0.0.1:8080`) |
 | service user | `urlshort` |
 
-## SECURITY — read first
+## SECURITY - read first
 
 Real secrets must NEVER be committed to this repo (it is public on GitHub). There
 is exactly ONE auth secret: the app password. There is NO separate API token. The
@@ -126,11 +126,11 @@ sudo cp /opt/url-shortner/deploy/Caddyfile /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-Now jump to **section 5 (Verification)**.
+Now jump to **section 3 (Verification)**.
 
 ---
 
-## 2. Redeploy after a code change  ← the immediate need (turns ON the API)
+## 2. Redeploy after a code change <- the immediate need (turns ON the API)
 
 The service is already live on the pre-API build. This redeploy pulls in the JSON
 API + CLI + root-redirect AND switches auth from plaintext `APP_PASSWORD` to the
@@ -227,7 +227,7 @@ plaintext password from passctl, hashes it, and wraps the same API.)
 
 ---
 
-## 5. Backups (optional, one-time) — Litestream
+## 5. Backups (optional, one-time) - Litestream
 
 Stream the SQLite DB to object storage for point-in-time recovery.
 
