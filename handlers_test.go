@@ -16,11 +16,11 @@ func newTestServer(t *testing.T) (*Server, http.Handler) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	cfg := &Config{
-		Port:          "0",
-		DatabasePath:  dbPath,
-		AuthMode:      "password",
-		AppPassword:   "secret",
-		SessionSecret: []byte("test-secret-do-not-use-in-prod"),
+		Port:            "0",
+		DatabasePath:    dbPath,
+		AuthMode:        "password",
+		AppPasswordHash: sha256Hex("secret"),
+		SessionSecret:   []byte("test-secret-do-not-use-in-prod"),
 	}
 	store, err := OpenStore(dbPath)
 	if err != nil {
@@ -174,9 +174,29 @@ func apiReq(h http.Handler, method, target, body, token string) *httptest.Respon
 	return rec
 }
 
-// tok is the bearer token for the API: the shared app password (same secret the
-// web UI uses), set to "secret" in newTestServer.
-const tok = "secret"
+// tok is the bearer token for the API: the lowercase-hex SHA-256 of the app
+// password "secret" (the password the web UI uses in newTestServer). The raw
+// password is never sent over the API.
+var tok = sha256Hex("secret")
+
+// TestWebLoginHashesPassword confirms the web login compares the SHA-256 of the
+// submitted plaintext against the stored hash: the right password logs in, a
+// wrong one is rejected. (The server holds only the hash.)
+func TestWebLoginHashesPassword(t *testing.T) {
+	_, h := newTestServer(t)
+	// Right password ("secret") -> session cookie set (authedCookie fatals if not).
+	_ = authedCookie(t, h)
+	// Wrong password -> 401, no session cookie.
+	rec := do(h, http.MethodPost, "/auth/login", url.Values{"password": {"wrong"}}, nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong web password = %d, want 401", rec.Code)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			t.Fatal("wrong web password set a session cookie")
+		}
+	}
+}
 
 func TestAPILinkCRUDLifecycle(t *testing.T) {
 	_, h := newTestServer(t)

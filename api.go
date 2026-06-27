@@ -39,16 +39,20 @@ func writeAPIError(w http.ResponseWriter, status int, msg string) {
 }
 
 // apiAuth gates every /api/* request behind a Bearer token whose value is the
-// shared app password (Authorization: Bearer <APP_PASSWORD>), compared in
-// constant time. There is no separate API token: one secret gates both the web
-// UI (session cookie) and the API. APP_PASSWORD is required for the app to start,
-// so the API is always enabled. Returns true if the request may proceed;
-// otherwise it has already written the response.
+// lowercase-hex SHA-256 of the app password (Authorization: Bearer
+// <sha256-hex-of-password>), constant-time compared to APP_PASSWORD_HASH. The raw
+// password never rides the API, and the server holds only the hash. There is no
+// separate API token: one secret (the password) gates both the web UI (session
+// cookie) and the API. APP_PASSWORD_HASH is required for the app to start, so the
+// API is always enabled. Returns true if the request may proceed; otherwise it
+// has already written the response.
 func (s *Server) apiAuth(w http.ResponseWriter, r *http.Request) bool {
 	const prefix = "Bearer "
 	h := r.Header.Get("Authorization")
 	if !strings.HasPrefix(h, prefix) ||
-		subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(h, prefix)), []byte(s.cfg.AppPassword)) != 1 {
+		subtle.ConstantTimeCompare(
+			[]byte(strings.ToLower(strings.TrimSpace(strings.TrimPrefix(h, prefix)))),
+			[]byte(s.cfg.AppPasswordHash)) != 1 {
 		writeAPIError(w, http.StatusUnauthorized, "missing or invalid bearer token")
 		return false
 	}

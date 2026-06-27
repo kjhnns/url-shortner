@@ -20,14 +20,23 @@ Canonical paths and names (must stay consistent with `deploy/`):
 ## SECURITY — read first
 
 Real secrets must NEVER be committed to this repo (it is public on GitHub). There
-is exactly ONE auth secret: the app password (`APP_PASSWORD`). It also serves as
-the JSON API's Bearer token, so there is NO separate API token. It lives ONLY in:
+is exactly ONE auth secret: the app password. There is NO separate API token. The
+server NEVER holds the plaintext: it stores only the lowercase-hex SHA-256 of the
+password in `APP_PASSWORD_HASH`, and the JSON API's Bearer token is that same
+hash. The plaintext lives ONLY in:
 
 1. the operator's passctl: `gojoe/app-password`, and
-2. the runtime env file `/etc/url-shortner.env`, which is `chmod 600` and is NOT
-   tracked by git.
+2. nowhere else at rest. The runtime env file `/etc/url-shortner.env` (chmod 600,
+   NOT tracked by git) holds only the HASH (`APP_PASSWORD_HASH`), not the plaintext.
 
-Everywhere in this repo you see `<set-from-passctl ...>` it is a PLACEHOLDER. The
+Derive the hash (raw bytes, no trailing newline, lowercase hex) with:
+
+```sh
+printf '%s' "$(passctl get gojoe/app-password)" | shasum -a 256
+```
+
+Everywhere in this repo you see `<set-from-passctl ...>` or `<lowercase-hex...>`
+it is a PLACEHOLDER. The
 operator substitutes the real value out of band when writing `/etc/url-shortner.env`.
 
 ---
@@ -81,18 +90,30 @@ sudo git checkout main      # or: sudo git checkout feat/shortener
 # 1c. Build the server binary.
 sudo /usr/local/go/bin/go build -o /usr/local/bin/url-shortner .
 
-# 1d. Runtime env file. Substitute the <...> placeholders with the REAL values
-#     from passctl. DO NOT commit this file (it is /etc, not the repo).
-sudo tee /etc/url-shortner.env >/dev/null <<'EOF'
+# 1d. Runtime env file. The env file holds the HASH only, never the plaintext.
+#     Derive the hash from the plaintext app password and write the file. The
+#     plaintext is supplied out of band (passctl on the operator's machine, or
+#     paste it here once); it is NOT stored on the box.
+#
+#     If passctl is available on the box:
+#       APP_PW="$(passctl get gojoe/app-password)"
+#     otherwise paste it for this one command (leading space keeps it out of the
+#     shell history if HISTCONTROL=ignorespace):
+APP_PW='<the plaintext app password, out of band>'
+APP_HASH="$(printf '%s' "$APP_PW" | shasum -a 256 | awk '{print $1}')"
+SESSION="$(openssl rand -hex 32)"
+
+sudo tee /etc/url-shortner.env >/dev/null <<EOF
 AUTH_MODE=password
-APP_PASSWORD=<set-from-passctl gojoe/app-password>
-SESSION_SECRET=<long-random-string, generate with: openssl rand -hex 32>
+APP_PASSWORD_HASH=${APP_HASH}
+SESSION_SECRET=${SESSION}
 PORT=8080
 DATABASE_PATH=/var/lib/url-shortner/shortener.db
 BASE_URL=https://gojoe.run
 EOF
 sudo chmod 600 /etc/url-shortner.env
 sudo chown root:root /etc/url-shortner.env
+unset APP_PW APP_HASH SESSION   # don't leave the plaintext/secret in the shell
 
 # 1e. Install + enable the systemd unit (from deploy/).
 sudo cp /opt/url-shortner/deploy/url-shortner.service /etc/systemd/system/url-shortner.service
@@ -111,20 +132,32 @@ Now jump to **section 5 (Verification)**.
 
 ## 2. Redeploy after a code change  ← the immediate need (turns ON the API)
 
-The service is already live on the pre-API build. The new JSON API authenticates
-with the EXISTING `APP_PASSWORD` (no new env var to set), so turning it on is just
-a redeploy:
+The service is already live on the pre-API build. This redeploy pulls in the JSON
+API + CLI + root-redirect AND switches auth from plaintext `APP_PASSWORD` to the
+hashed `APP_PASSWORD_HASH`. The new build REQUIRES `APP_PASSWORD_HASH` and will
+refuse to start on the old `APP_PASSWORD` env var, so update the env file as part
+of this step:
 
 ```sh
 cd /opt/url-shortner
 sudo git pull --ff-only
 sudo /usr/local/go/bin/go build -o /usr/local/bin/url-shortner .
+
+# One-time env migration: replace APP_PASSWORD=<plaintext> with APP_PASSWORD_HASH.
+APP_PW="$(passctl get gojoe/app-password)"   # or paste plaintext out of band
+APP_HASH="$(printf '%s' "$APP_PW" | shasum -a 256 | awk '{print $1}')"
+sudo sed -i '/^APP_PASSWORD=/d' /etc/url-shortner.env
+grep -q '^APP_PASSWORD_HASH=' /etc/url-shortner.env \
+  && sudo sed -i "s|^APP_PASSWORD_HASH=.*|APP_PASSWORD_HASH=${APP_HASH}|" /etc/url-shortner.env \
+  || echo "APP_PASSWORD_HASH=${APP_HASH}" | sudo tee -a /etc/url-shortner.env >/dev/null
+unset APP_PW APP_HASH
+
 sudo systemctl restart url-shortner
 sudo systemctl status url-shortner --no-pager
 ```
 
-Then verify (section 3). The API is enabled automatically because `APP_PASSWORD`
-is already set in `/etc/url-shortner.env` (it is required for the app to start).
+Then verify (section 3). The API is enabled automatically because
+`APP_PASSWORD_HASH` is set (it is required for the app to start).
 
 ---
 
@@ -137,9 +170,9 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/healthz
 # 3b. Public health through Caddy + HTTPS: expect HTTP/2 200.
 curl -sI https://gojoe.run/healthz | head -1
 
-# 3c. API round-trip. The bearer token IS the app password; read it from the env
-#     file on the box (it is not in git):
-TOKEN=$(sudo sed -n 's/^APP_PASSWORD=//p' /etc/url-shortner.env)
+# 3c. API round-trip. The bearer token is the SHA-256 of the app password, which
+#     is exactly the APP_PASSWORD_HASH already in the env file on the box:
+TOKEN=$(sudo sed -n 's/^APP_PASSWORD_HASH=//p' /etc/url-shortner.env)
 
 # create a throwaway test link -> expect 201
 curl -s -w '\n%{http_code}\n' -X POST https://gojoe.run/api/links \
@@ -176,7 +209,9 @@ cd /opt/url-shortner
 sudo /usr/local/go/bin/go build -o /usr/local/bin/shortcli ./cmd/shortcli
 
 export GOJOE_BASE_URL=https://gojoe.run
-export GOJOE_API_TOKEN=$(sudo sed -n 's/^APP_PASSWORD=//p' /etc/url-shortner.env)  # carries the app password
+# The CLI hashes the plaintext itself, so give it the PLAINTEXT (the box stores
+# only the hash). Use passctl if available, else paste it out of band:
+export GOJOE_PASSWORD="$(passctl get gojoe/app-password)"
 
 while read -r slug url; do
   [ -z "$slug" ] && continue
@@ -188,7 +223,7 @@ shortcli list   # confirm they were created
 ```
 
 (The clawd `short-url` skill is the equivalent for the assistant: it reads the
-token from passctl and wraps the same API.)
+plaintext password from passctl, hashes it, and wraps the same API.)
 
 ---
 

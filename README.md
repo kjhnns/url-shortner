@@ -23,11 +23,19 @@ Reserved top-level paths that are never treated as slugs: `/admin`, `/auth`,
 The **shipped version is password-only.** Public redirects are open to everyone;
 the claim/save page and all of `/admin` sit behind a single shared password.
 
-- `AUTH_MODE=password` (the only supported mode today): one shared password
-  (`APP_PASSWORD`). `/auth/login` checks it and sets an HMAC-signed session
+- `AUTH_MODE=password` (the only supported mode today): one shared password. The
+  server stores **only its SHA-256 hash** (`APP_PASSWORD_HASH`, lowercase hex),
+  never the plaintext. `/auth/login` SHA-256s the submitted plaintext (inside TLS)
+  and constant-time compares it to the hash, then sets an HMAC-signed session
   cookie (`crypto/hmac`, secret from `SESSION_SECRET` or an ephemeral one if
   unset). `/auth/logout` clears it. The app **refuses to start** if
-  `APP_PASSWORD` is unset, so it never runs wide open.
+  `APP_PASSWORD_HASH` is unset, so it never runs wide open.
+
+  Derive the hash (raw bytes, no trailing newline, lowercase hex):
+
+  ```sh
+  printf '%s' '<the app password>' | shasum -a 256   # -> APP_PASSWORD_HASH
+  ```
 
 The auth layer is a single middleware (`Auth.Middleware`) wrapping the protected
 routes, so a richer mode can be added later without restructuring.
@@ -53,13 +61,15 @@ middleware (not shipped yet):
 | `DATABASE_PATH` | `./shortener.db` | SQLite file (WAL mode) |
 | `BASE_URL` | _(empty)_ | e.g. `https://gojoe.run`; enables Secure cookies |
 | `AUTH_MODE` | `password` | only `password` supported |
-| `APP_PASSWORD` | _(required)_ | shared password; app won't start without it. Also the JSON API's Bearer token (one secret for both surfaces). |
+| `APP_PASSWORD_HASH` | _(required)_ | lowercase hex SHA-256 of the app password; app won't start without it. Gates both the web UI and the JSON API (one secret, only its hash at rest). |
 | `SESSION_SECRET` | _(generated)_ | set to a long random string to persist sessions across restarts |
 
 ## Run locally (password mode)
 
 ```sh
-APP_PASSWORD=secret PORT=8080 go run .
+# Hash the password once; the server only ever sees the hash.
+export APP_PASSWORD_HASH=$(printf '%s' 'secret' | shasum -a 256 | awk '{print $1}')
+APP_PASSWORD_HASH=$APP_PASSWORD_HASH PORT=8080 go run .
 # then open http://localhost:8080/admin and sign in with "secret"
 ```
 
@@ -67,7 +77,7 @@ Build a binary:
 
 ```sh
 go build -o url-shortner .
-APP_PASSWORD=secret ./url-shortner
+APP_PASSWORD_HASH=$(printf '%s' 'secret' | shasum -a 256 | awk '{print $1}') ./url-shortner
 ```
 
 ## Root redirect (configurable)
@@ -84,14 +94,15 @@ It is also exposed over the API:
 
 ## JSON API
 
-A minimal, plain REST API. **There is one secret total**: the API uses the same
-`APP_PASSWORD` as the web UI, sent as a Bearer token. The web UI authenticates
-with the session cookie; the API authenticates with `Authorization: Bearer
-<APP_PASSWORD>`; both gate the same link operations.
+A minimal, plain REST API. **There is one secret total** (the app password) and
+no separate API token. The web UI uses the session cookie; the API uses a Bearer
+token whose value is the **SHA-256 hash of the password** (lowercase hex), so the
+raw password never rides the API and the server only ever holds the hash
+(`APP_PASSWORD_HASH`). Both surfaces gate the same link operations.
 
-- Every request must send `Authorization: Bearer <APP_PASSWORD>` or it is
-  rejected with `401`. (`APP_PASSWORD` is required for the app to start, so the
-  API is always enabled.)
+- Every request must send `Authorization: Bearer <sha256-hex-of-password>` or it
+  is rejected with `401`. (`APP_PASSWORD_HASH` is required for the app to start,
+  so the API is always enabled.)
 - Errors are a simple JSON envelope: `{"error":"..."}`.
 
 | Method & path | Body | Result |
@@ -107,7 +118,8 @@ reserved path), target must be an absolute `http(s)` URL. Invalid input returns
 `400`. `POST` is create-only (no upsert): use `PUT` to change an existing target.
 
 ```sh
-PW=<the APP_PASSWORD value>   # same secret as the web login (passctl gojoe/app-password)
+# The bearer token is the SHA-256 of the app password (passctl gojoe/app-password):
+PW=$(printf '%s' "$(passctl get gojoe/app-password)" | shasum -a 256 | awk '{print $1}')
 
 # create
 curl -X POST https://gojoe.run/api/links \
@@ -130,7 +142,8 @@ A dependency-free Go client for the API, in the same module under `cmd/shortcli`
 ```sh
 go build -o shortcli ./cmd/shortcli
 export GOJOE_BASE_URL=https://gojoe.run     # default; override for local testing
-export GOJOE_API_TOKEN=<the APP_PASSWORD value>   # carries the app password
+export GOJOE_PASSWORD='<the app password>'  # plaintext; CLI hashes it itself
+# (or omit GOJOE_PASSWORD and let the CLI read passctl gojoe/app-password)
 
 shortcli create <slug> <url>
 shortcli list
@@ -140,9 +153,10 @@ shortcli delete <slug>
 ```
 
 It reads the base URL from `GOJOE_BASE_URL` (default `https://gojoe.run`) and the
-bearer token from `GOJOE_API_TOKEN` (which carries the **app password** —
-`passctl gojoe/app-password`; there is no separate API token). Output is plain
-text; errors print the server's `{"error":...}` message and exit non-zero.
+plaintext app password from `GOJOE_PASSWORD` (or, if unset, from `passctl
+gojoe/app-password`), then sends its **SHA-256 hash** as the Bearer token. There
+is no separate API token. Output is plain text; errors print the server's
+`{"error":...}` message and exit non-zero.
 
 ## Seeding existing links
 
