@@ -13,6 +13,21 @@
     <a class="muted" href="/auth/logout">Sign out</a>
   </div>
 
+  <div class="card">
+    <div class="card-head"><strong>Root redirect</strong></div>
+    <p class="muted">Where <code>/</code> sends visitors. Leave empty for the landing page.</p>
+    <form method="post" action="/admin/root-redirect" class="inline">
+      <input name="target_url" type="url" value="{{.RootRedirect}}" placeholder="https://example.com">
+      <button type="submit">Save</button>
+    </form>
+    {{if .RootRedirect}}
+    <form method="post" action="/admin/root-redirect" class="inline">
+      <input type="hidden" name="target_url" value="">
+      <button type="submit" class="danger">Clear</button>
+    </form>
+    {{end}}
+  </div>
+
   {{if not .Links}}
     <p class="muted">No links yet. Visit any unclaimed <code>/&lt;slug&gt;</code> to create one.</p>
   {{end}}

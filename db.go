@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS links (
 	created_by      TEXT,
 	clicks          INTEGER DEFAULT 0,
 	last_visited_at TEXT
+);
+CREATE TABLE IF NOT EXISTS settings (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
 );`
 
 // OpenStore opens (creating if needed) the SQLite database, applies WAL and
@@ -104,6 +108,35 @@ func (s *Store) DeleteLink(slug string) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// settingRootRedirect is the settings key for the configurable root (/) redirect.
+const settingRootRedirect = "root_redirect"
+
+// GetSetting returns the value for key, or "" if it is unset.
+func (s *Store) GetSetting(key string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
+// SetSetting upserts key=value. An empty value deletes the row (treated as unset).
+func (s *Store) SetSetting(key, value string) error {
+	if value == "" {
+		_, err := s.db.Exec(`DELETE FROM settings WHERE key = ?`, key)
+		return err
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		key, value)
+	return err
 }
 
 // RecordVisit increments the click counter and stamps last_visited_at.

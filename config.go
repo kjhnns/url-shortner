@@ -14,7 +14,9 @@ type Config struct {
 
 	AuthMode string // currently only "password"
 
-	// password mode: shared password + HMAC-signed session cookie
+	// password mode: shared password + HMAC-signed session cookie. The same
+	// AppPassword also authenticates the JSON API, sent as a Bearer token
+	// (Authorization: Bearer <APP_PASSWORD>). One secret gates both surfaces.
 	AppPassword   string
 	SessionSecret []byte
 }

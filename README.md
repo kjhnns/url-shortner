@@ -53,7 +53,7 @@ middleware (not shipped yet):
 | `DATABASE_PATH` | `./shortener.db` | SQLite file (WAL mode) |
 | `BASE_URL` | _(empty)_ | e.g. `https://gojoe.run`; enables Secure cookies |
 | `AUTH_MODE` | `password` | only `password` supported |
-| `APP_PASSWORD` | _(required)_ | shared password; app won't start without it |
+| `APP_PASSWORD` | _(required)_ | shared password; app won't start without it. Also the JSON API's Bearer token (one secret for both surfaces). |
 | `SESSION_SECRET` | _(generated)_ | set to a long random string to persist sessions across restarts |
 
 ## Run locally (password mode)
@@ -68,6 +68,93 @@ Build a binary:
 ```sh
 go build -o url-shortner .
 APP_PASSWORD=secret ./url-shortner
+```
+
+## Root redirect (configurable)
+
+`gojoe.run/` (the root) is configurable from the admin panel. In `/admin` there is
+a **Root redirect** field: set an absolute http(s) URL and `/` will `302` there
+(public, no auth to follow). Leave it empty (or hit **Clear**) to fall back to the
+minimal landing page. `/` is always a reserved path, never a normal slug.
+
+It is also exposed over the API:
+
+- `GET /api/settings/root_redirect` -> `{"target":"..."}` (`""` if unset)
+- `PUT /api/settings/root_redirect` body `{"target":"https://..."}` (empty target clears it)
+
+## JSON API
+
+A minimal, plain REST API. **There is one secret total**: the API uses the same
+`APP_PASSWORD` as the web UI, sent as a Bearer token. The web UI authenticates
+with the session cookie; the API authenticates with `Authorization: Bearer
+<APP_PASSWORD>`; both gate the same link operations.
+
+- Every request must send `Authorization: Bearer <APP_PASSWORD>` or it is
+  rejected with `401`. (`APP_PASSWORD` is required for the app to start, so the
+  API is always enabled.)
+- Errors are a simple JSON envelope: `{"error":"..."}`.
+
+| Method & path | Body | Result |
+| --- | --- | --- |
+| `POST /api/links` | `{"slug":"...","target":"..."}` | `201` with the link; `409` if the slug already exists |
+| `GET /api/links` | _(none)_ | `200` JSON array: `slug, target, clicks, created_at, updated_at` |
+| `GET /api/links/{slug}` | _(none)_ | `200` the link; `404` if absent |
+| `PUT /api/links/{slug}` | `{"target":"..."}` | `200` the updated link; `404` if absent |
+| `DELETE /api/links/{slug}` | _(none)_ | `200` `{"status":"deleted","slug":"..."}`; `404` if absent |
+
+Validation is shared with the web UI: slug `^[A-Za-z0-9_-]{1,64}$` (and not a
+reserved path), target must be an absolute `http(s)` URL. Invalid input returns
+`400`. `POST` is create-only (no upsert): use `PUT` to change an existing target.
+
+```sh
+PW=<the APP_PASSWORD value>   # same secret as the web login (passctl gojoe/app-password)
+
+# create
+curl -X POST https://gojoe.run/api/links \
+  -H "Authorization: Bearer $PW" -H "Content-Type: application/json" \
+  -d '{"slug":"wishlist","target":"https://kjhnns.github.io/agent-workspace/wishlist.html"}'
+
+# list / get / update / delete
+curl https://gojoe.run/api/links            -H "Authorization: Bearer $PW"
+curl https://gojoe.run/api/links/wishlist   -H "Authorization: Bearer $PW"
+curl -X PUT https://gojoe.run/api/links/wishlist \
+  -H "Authorization: Bearer $PW" -H "Content-Type: application/json" \
+  -d '{"target":"https://example.com/new"}'
+curl -X DELETE https://gojoe.run/api/links/wishlist -H "Authorization: Bearer $PW"
+```
+
+## CLI (`shortcli`)
+
+A dependency-free Go client for the API, in the same module under `cmd/shortcli`.
+
+```sh
+go build -o shortcli ./cmd/shortcli
+export GOJOE_BASE_URL=https://gojoe.run     # default; override for local testing
+export GOJOE_API_TOKEN=<the APP_PASSWORD value>   # carries the app password
+
+shortcli create <slug> <url>
+shortcli list
+shortcli get <slug>
+shortcli update <slug> <url>
+shortcli delete <slug>
+```
+
+It reads the base URL from `GOJOE_BASE_URL` (default `https://gojoe.run`) and the
+bearer token from `GOJOE_API_TOKEN` (which carries the **app password** —
+`passctl gojoe/app-password`; there is no separate API token). Output is plain
+text; errors print the server's `{"error":...}` message and exit non-zero.
+
+## Seeding existing links
+
+`deploy/seed-links.txt` lists Joe's existing public pages (`slug url` per line).
+After the API is live (see `DEPLOY.md`), create them all in one loop:
+
+```sh
+while read -r slug url; do
+  [ -z "$slug" ] && continue
+  case "$slug" in \#*) continue ;; esac
+  shortcli create "$slug" "$url"
+done < deploy/seed-links.txt
 ```
 
 ## Schema
@@ -95,7 +182,10 @@ go test ./...
 
 Covers: healthz, protected routes rejecting unauthenticated requests, the claim
 page for unknown slugs (authed), and the full create -> 302 redirect ->
-admin-list -> update -> delete lifecycle, plus slug/URL validation.
+admin-list -> update -> delete lifecycle, plus slug/URL validation. Also covers
+the JSON API (create/list/get/update/delete happy paths, `401` without/with the
+wrong bearer token, `404` for a missing slug, `400` validation) and the
+configurable root redirect (set -> `302`, clear -> landing `200`).
 
 ## Deployment (Hetzner box, no Docker)
 
@@ -111,4 +201,6 @@ DNS: point gojoe.run's A/AAAA records (Namecheap) at the Hetzner box.
 Backups: run **Litestream** against `DATABASE_PATH` to stream the SQLite DB to
 object storage (e.g. an S3-compatible bucket) for point-in-time recovery.
 
-See `deploy/` for the example systemd unit and Caddyfile.
+See `deploy/` for the example systemd unit and Caddyfile, and **`DEPLOY.md`** for
+a precise, copy-pasteable runbook (initial deploy, redeploy-after-change, turning
+on the API, verification, and seeding).
