@@ -1,0 +1,11 @@
+# SQLite database + WAL/SHM sidecars
+*.db
+*.db-wal
+*.db-shm
+
+# Built binary
+/url-shortner
+/shortener
+
+# Local env
+.env
