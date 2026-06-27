@@ -5,8 +5,11 @@
 #
 # Put the secrets in /etc/url-shortner.env (chmod 600), for example:
 #   AUTH_MODE=password
-#   APP_PASSWORD=change-me
-#   SESSION_SECRET=some-long-random-string
+#   # APP_PASSWORD_HASH is the lowercase hex sha256 of the app password. The
+#   # server never holds the plaintext. Derive it from passctl gojoe/app-password:
+#   #   printf '%s' "$(passctl get gojoe/app-password)" | shasum -a 256
+#   APP_PASSWORD_HASH=<lowercase-hex-sha256-of-the-app-password>
+#   SESSION_SECRET=<long-random-string, e.g. openssl rand -hex 32>
 #   PORT=8080
 #   DATABASE_PATH=/var/lib/url-shortner/shortener.db
 #   BASE_URL=https://gojoe.run

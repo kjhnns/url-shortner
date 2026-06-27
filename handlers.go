@@ -73,6 +73,12 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("/admin", s.auth.Middleware(http.HandlerFunc(s.handleAdmin)))
 	mux.Handle("/admin/update", s.auth.Middleware(http.HandlerFunc(s.handleAdminUpdate)))
 	mux.Handle("/admin/delete", s.auth.Middleware(http.HandlerFunc(s.handleAdminDelete)))
+	mux.Handle("/admin/root-redirect", s.auth.Middleware(http.HandlerFunc(s.handleAdminRootRedirect)))
+
+	// JSON API (Bearer token; auth enforced inside the handlers).
+	mux.HandleFunc("/api/links", s.handleAPILinks)
+	mux.HandleFunc("/api/links/", s.handleAPILink)
+	mux.HandleFunc("/api/settings/root_redirect", s.handleAPIRootRedirect)
 
 	// Root + slug catch-all.
 	mux.HandleFunc("/", s.handleRoot)
@@ -90,6 +96,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(r.URL.Path, "/")
 	if path == "" {
+		// Configurable root redirect: if set, 302 there (public); else landing.
+		if target, err := s.store.GetSetting(settingRootRedirect); err == nil && target != "" {
+			http.Redirect(w, r, target, http.StatusFound)
+			return
+		}
 		s.render(w, "landing.html", map[string]any{"BaseURL": s.cfg.BaseURL})
 		return
 	}
@@ -168,10 +179,35 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
+	rootRedirect, err := s.store.GetSetting(settingRootRedirect)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
 	s.render(w, "admin.html", map[string]any{
-		"Links":   links,
-		"BaseURL": s.cfg.BaseURL,
+		"Links":        links,
+		"BaseURL":      s.cfg.BaseURL,
+		"RootRedirect": rootRedirect,
 	})
+}
+
+// handleAdminRootRedirect saves (or clears) the configurable root (/) redirect.
+// An empty target clears it (back to the landing page).
+func (s *Server) handleAdminRootRedirect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	target := strings.TrimSpace(r.FormValue("target_url"))
+	if target != "" && !validTargetURL(target) {
+		http.Error(w, "invalid url", http.StatusBadRequest)
+		return
+	}
+	if err := s.store.SetSetting(settingRootRedirect, target); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin", http.StatusFound)
 }
 
 func (s *Server) handleAdminUpdate(w http.ResponseWriter, r *http.Request) {

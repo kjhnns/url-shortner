@@ -1,0 +1,33 @@
+# gojoe.run seed links - slug<space>url, one per line.
+#
+# Lines starting with "#" and blank lines are ignored.
+# After the API is deployed (see DEPLOY.md), create these by running shortcli
+# (or the clawd short-url skill) over this file, e.g.:
+#
+#   while read -r slug url; do
+#     [ -z "$slug" ] && continue
+#     case "$slug" in \#*) continue ;; esac
+#     shortcli create "$slug" "$url"
+#   done < deploy/seed-links.txt
+#
+# These are real, Joe-owned public pages evidenced from the clawd workspace
+# (wiki/, memory/, status-page memory). The service is NOT yet deployed with
+# the API, so DO NOT run this until after the redeploy.
+
+wishlist   https://kjhnns.github.io/agent-workspace/wishlist.html
+status     https://kjhnns.github.io/agent-workspace/status.html
+variables  https://app.logvariables.com
+varsite    https://kjhnns.github.io/Logvariables-website
+
+# ----------------------------------------------------------------------------
+# CANDIDATES TO CONFIRM WITH JOE (not seeded automatically; uncertain target,
+# slug, or whether a stable public page exists):
+#
+#   blog       https://bearblog.dev/johannesklumpe/   (only dashboard URLs were
+#              evidenced in the workspace; confirm the public blog URL + slug)
+#   jobradar   ?  (job_radar is a standalone repo at ~/Documents/job_radar with
+#              no github.io page evidenced; confirm if/where it is published)
+#   varslug    "variables" vs "varsite": confirm which slug Joe wants for the
+#              app (app.logvariables.com) vs the marketing site
+#              (kjhnns.github.io/Logvariables-website)
+# ----------------------------------------------------------------------------

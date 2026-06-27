@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,11 +16,11 @@ func newTestServer(t *testing.T) (*Server, http.Handler) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	cfg := &Config{
-		Port:          "0",
-		DatabasePath:  dbPath,
-		AuthMode:      "password",
-		AppPassword:   "secret",
-		SessionSecret: []byte("test-secret-do-not-use-in-prod"),
+		Port:            "0",
+		DatabasePath:    dbPath,
+		AuthMode:        "password",
+		AppPasswordHash: sha256Hex("secret"),
+		SessionSecret:   []byte("test-secret-do-not-use-in-prod"),
 	}
 	store, err := OpenStore(dbPath)
 	if err != nil {
@@ -156,6 +157,228 @@ func TestRejectInvalidTargetURL(t *testing.T) {
 	rec := do(h, http.MethodPost, "/bad", url.Values{"target_url": {"not a url"}}, c)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid url claim = %d, want 400", rec.Code)
+	}
+}
+
+// apiReq issues a JSON request with an optional bearer token.
+func apiReq(h http.Handler, method, target, body, token string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// tok is the bearer token for the API: the lowercase-hex SHA-256 of the app
+// password "secret" (the password the web UI uses in newTestServer). The raw
+// password is never sent over the API.
+var tok = sha256Hex("secret")
+
+// TestWebLoginHashesPassword confirms the web login compares the SHA-256 of the
+// submitted plaintext against the stored hash: the right password logs in, a
+// wrong one is rejected. (The server holds only the hash.)
+func TestWebLoginHashesPassword(t *testing.T) {
+	_, h := newTestServer(t)
+	// Right password ("secret") -> session cookie set (authedCookie fatals if not).
+	_ = authedCookie(t, h)
+	// Wrong password -> 401, no session cookie.
+	rec := do(h, http.MethodPost, "/auth/login", url.Values{"password": {"wrong"}}, nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong web password = %d, want 401", rec.Code)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			t.Fatal("wrong web password set a session cookie")
+		}
+	}
+}
+
+func TestAPILinkCRUDLifecycle(t *testing.T) {
+	_, h := newTestServer(t)
+
+	// CREATE -> 201
+	rec := apiReq(h, http.MethodPost, "/api/links",
+		`{"slug":"go","target":"https://example.com/first"}`, tok)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	var created apiLink
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("create body not JSON: %v", err)
+	}
+	if created.Slug != "go" || created.Target != "https://example.com/first" {
+		t.Fatalf("create returned %+v", created)
+	}
+
+	// CREATE duplicate -> 409
+	rec = apiReq(h, http.MethodPost, "/api/links",
+		`{"slug":"go","target":"https://example.com/dup"}`, tok)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate create = %d, want 409", rec.Code)
+	}
+
+	// LIST -> 200, contains it
+	rec = apiReq(h, http.MethodGet, "/api/links", "", tok)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d, want 200", rec.Code)
+	}
+	var list []apiLink
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("list body not JSON array: %v", err)
+	}
+	if len(list) != 1 || list[0].Slug != "go" {
+		t.Fatalf("list = %+v, want one slug 'go'", list)
+	}
+
+	// GET -> 200
+	rec = apiReq(h, http.MethodGet, "/api/links/go", "", tok)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get = %d, want 200", rec.Code)
+	}
+
+	// UPDATE -> 200, new target
+	rec = apiReq(h, http.MethodPut, "/api/links/go",
+		`{"target":"https://example.com/second"}`, tok)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update = %d, want 200", rec.Code)
+	}
+	var updated apiLink
+	json.Unmarshal(rec.Body.Bytes(), &updated)
+	if updated.Target != "https://example.com/second" {
+		t.Fatalf("update target = %q, want .../second", updated.Target)
+	}
+
+	// DELETE -> 200
+	rec = apiReq(h, http.MethodDelete, "/api/links/go", "", tok)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete = %d, want 200", rec.Code)
+	}
+
+	// GET after delete -> 404
+	rec = apiReq(h, http.MethodGet, "/api/links/go", "", tok)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("get after delete = %d, want 404", rec.Code)
+	}
+}
+
+func TestAPIRejectsMissingToken(t *testing.T) {
+	_, h := newTestServer(t)
+	rec := apiReq(h, http.MethodGet, "/api/links", "", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no-token = %d, want 401", rec.Code)
+	}
+	rec = apiReq(h, http.MethodGet, "/api/links", "", "wrong-token")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bad-token = %d, want 401", rec.Code)
+	}
+}
+
+func TestAPIGetMissingSlug404(t *testing.T) {
+	_, h := newTestServer(t)
+	rec := apiReq(h, http.MethodGet, "/api/links/nope", "", tok)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing slug = %d, want 404", rec.Code)
+	}
+	rec = apiReq(h, http.MethodPut, "/api/links/nope", `{"target":"https://x.com"}`, tok)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("update missing = %d, want 404", rec.Code)
+	}
+	rec = apiReq(h, http.MethodDelete, "/api/links/nope", "", tok)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("delete missing = %d, want 404", rec.Code)
+	}
+}
+
+func TestAPIValidationRejects(t *testing.T) {
+	_, h := newTestServer(t)
+	// bad slug
+	rec := apiReq(h, http.MethodPost, "/api/links",
+		`{"slug":"has space","target":"https://x.com"}`, tok)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad slug = %d, want 400", rec.Code)
+	}
+	// reserved slug
+	rec = apiReq(h, http.MethodPost, "/api/links",
+		`{"slug":"admin","target":"https://x.com"}`, tok)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("reserved slug = %d, want 400", rec.Code)
+	}
+	// bad target
+	rec = apiReq(h, http.MethodPost, "/api/links",
+		`{"slug":"okslug","target":"not a url"}`, tok)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad target = %d, want 400", rec.Code)
+	}
+}
+
+func TestRootRedirectConfigurable(t *testing.T) {
+	srv, h := newTestServer(t)
+
+	// Before: landing page (200).
+	rec := do(h, http.MethodGet, "/", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root before set = %d, want 200 (landing)", rec.Code)
+	}
+
+	// Set root_redirect.
+	if err := srv.store.SetSetting(settingRootRedirect, "https://example.com/home"); err != nil {
+		t.Fatalf("set setting: %v", err)
+	}
+	rec = do(h, http.MethodGet, "/", nil, nil)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("root after set = %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "https://example.com/home" {
+		t.Fatalf("root redirect Location = %q", loc)
+	}
+
+	// Clear it: back to landing (200).
+	if err := srv.store.SetSetting(settingRootRedirect, ""); err != nil {
+		t.Fatalf("clear setting: %v", err)
+	}
+	rec = do(h, http.MethodGet, "/", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root after clear = %d, want 200 (landing)", rec.Code)
+	}
+}
+
+func TestAPIRootRedirectEndpoint(t *testing.T) {
+	_, h := newTestServer(t)
+	// GET default -> "".
+	rec := apiReq(h, http.MethodGet, "/api/settings/root_redirect", "", tok)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get root_redirect = %d, want 200", rec.Code)
+	}
+	var got map[string]string
+	json.Unmarshal(rec.Body.Bytes(), &got)
+	if got["target"] != "" {
+		t.Fatalf("default root_redirect = %q, want empty", got["target"])
+	}
+	// PUT set.
+	rec = apiReq(h, http.MethodPut, "/api/settings/root_redirect",
+		`{"target":"https://example.com/h"}`, tok)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put root_redirect = %d, want 200", rec.Code)
+	}
+	rec = apiReq(h, http.MethodGet, "/api/settings/root_redirect", "", tok)
+	json.Unmarshal(rec.Body.Bytes(), &got)
+	if got["target"] != "https://example.com/h" {
+		t.Fatalf("after put root_redirect = %q", got["target"])
+	}
+	// PUT invalid -> 400.
+	rec = apiReq(h, http.MethodPut, "/api/settings/root_redirect", `{"target":"nope"}`, tok)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("put invalid root_redirect = %d, want 400", rec.Code)
+	}
+	// No token -> 401.
+	rec = apiReq(h, http.MethodGet, "/api/settings/root_redirect", "", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("root_redirect no token = %d, want 401", rec.Code)
 	}
 }
 

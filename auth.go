@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -30,6 +31,16 @@ func randomBytes(n int) []byte {
 }
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+
+// sha256Hex returns the lowercase hex SHA-256 of the raw UTF-8 bytes of s (no
+// trailing newline, no salt). This is the canonical hashing used everywhere: the
+// server hashes a submitted web password with it, the CLI/skill hash the
+// passctl plaintext with it to form the bearer token, and DEPLOY.md derives
+// APP_PASSWORD_HASH with `printf '%s' '<pw>' | shasum -a 256` to match.
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
 
 // Auth is the access-control layer. Today it implements a single shared
 // password with an HMAC-signed session cookie, exposed through one Middleware so
@@ -132,7 +143,10 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 func (a *Auth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	next := safeNext(r.FormValue("next"))
 	if r.Method == http.MethodPost {
-		if subtle.ConstantTimeCompare([]byte(r.FormValue("password")), []byte(a.cfg.AppPassword)) == 1 {
+		// The browser submits plaintext (inside TLS); hash it and constant-time
+		// compare to the stored hash. The server never holds the plaintext.
+		submitted := sha256Hex(r.FormValue("password"))
+		if subtle.ConstantTimeCompare([]byte(submitted), []byte(a.cfg.AppPasswordHash)) == 1 {
 			a.setSession(w, "")
 			http.Redirect(w, r, next, http.StatusFound)
 			return
