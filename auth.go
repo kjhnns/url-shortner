@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -19,6 +20,49 @@ const (
 	sessionCookie = "session"
 	sessionTTL    = 7 * 24 * time.Hour
 )
+
+// loginBackoff maps the number of consecutive failed login attempts to how long
+// the next attempt is locked out. The wait doubles each step (exponential
+// backoff) and is capped at the final entry. The first couple of failures are
+// free so an honest typo isn't immediately punished, after which a brute-force
+// guesser is throttled into the ground.
+var loginBackoff = []time.Duration{
+	0,                 // after 1 failure
+	0,                 // after 2 failures
+	5 * time.Second,   // after 3
+	10 * time.Second,  // after 4
+	20 * time.Second,  // after 5
+	40 * time.Second,  // after 6
+	80 * time.Second,  // after 7
+	160 * time.Second, // after 8
+	320 * time.Second, // after 9
+	640 * time.Second, // after 10+ (capped, ~10.6 min)
+}
+
+// lockoutFor returns how long to lock out the next login attempt after `fails`
+// consecutive failures, following the exponential loginBackoff table (capped at
+// the last entry).
+func lockoutFor(fails int) time.Duration {
+	if fails <= 0 {
+		return 0
+	}
+	if fails > len(loginBackoff) {
+		fails = len(loginBackoff)
+	}
+	return loginBackoff[fails-1]
+}
+
+// clientIP returns the client's IP (without port), used as the per-client
+// throttling identifier. It deliberately trusts only RemoteAddr (not
+// client-supplied X-Forwarded-For) so the backoff can't be bypassed by spoofing
+// a header.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
 
 // randomBytes returns n cryptographically-random bytes (panics only if the OS
 // RNG fails, which is unrecoverable).
@@ -47,10 +91,11 @@ func sha256Hex(s string) string {
 // a richer mode (Google OAuth + allowlist, Cloudflare Access) can be added later
 // without restructuring the routes.
 type Auth struct {
-	cfg *Config
+	cfg   *Config
+	store *Store
 }
 
-func NewAuth(cfg *Config) *Auth { return &Auth{cfg: cfg} }
+func NewAuth(cfg *Config, store *Store) *Auth { return &Auth{cfg: cfg, store: store} }
 
 // session is the data carried in the signed cookie. email is empty in password
 // mode (no per-user identity) but is kept so identity-bearing modes can fill it.
@@ -143,16 +188,36 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 func (a *Auth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	next := safeNext(r.FormValue("next"))
 	if r.Method == http.MethodPost {
+		id := clientIP(r)
+
+		// Throttle: if this client is still locked out by the exponential
+		// backoff, refuse before even checking the password.
+		if locked, retryAfter, err := a.store.LoginLocked(id); err == nil && locked {
+			secs := int(retryAfter.Seconds()) + 1
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			w.WriteHeader(http.StatusTooManyRequests)
+			renderLogin(w, next, fmt.Sprintf("Too many attempts. Try again in %d seconds.", secs))
+			return
+		}
+
 		// The browser submits plaintext (inside TLS); hash it and constant-time
 		// compare to the stored hash. The server never holds the plaintext.
 		submitted := sha256Hex(r.FormValue("password"))
 		if subtle.ConstantTimeCompare([]byte(submitted), []byte(a.cfg.AppPasswordHash)) == 1 {
+			a.store.ResetLoginAttempts(id) // clear the failure tally on success
 			a.setSession(w, "")
 			http.Redirect(w, r, next, http.StatusFound)
 			return
 		}
+
+		// Wrong password: record the failed attempt and apply the backoff.
+		lockout, _ := a.store.RecordLoginFailure(id)
+		msg := "Wrong password."
+		if lockout > 0 {
+			msg = fmt.Sprintf("Wrong password. Locked for %d seconds.", int(lockout.Seconds()))
+		}
 		w.WriteHeader(http.StatusUnauthorized)
-		renderLogin(w, next, "Wrong password.")
+		renderLogin(w, next, msg)
 		return
 	}
 	renderLogin(w, next, "")

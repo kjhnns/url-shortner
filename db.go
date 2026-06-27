@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS links (
 CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS login_attempts (
+	identifier   TEXT PRIMARY KEY,
+	fails        INTEGER NOT NULL DEFAULT 0,
+	last_attempt TEXT,
+	locked_until TEXT
 );`
 
 // OpenStore opens (creating if needed) the SQLite database, applies WAL and
@@ -144,6 +150,82 @@ func (s *Store) RecordVisit(slug string) error {
 	_, err := s.db.Exec(
 		`UPDATE links SET clicks = clicks + 1, last_visited_at = ? WHERE slug = ?`,
 		nowUTC(), slug)
+	return err
+}
+
+// LoginLocked reports whether identifier (the client IP) is currently locked out
+// by the login backoff, and if so how much of the lockout remains.
+func (s *Store) LoginLocked(identifier string) (bool, time.Duration, error) {
+	var lockedUntil sql.NullString
+	err := s.db.QueryRow(
+		`SELECT locked_until FROM login_attempts WHERE identifier = ?`, identifier).Scan(&lockedUntil)
+	if err == sql.ErrNoRows {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	if !lockedUntil.Valid || lockedUntil.String == "" {
+		return false, 0, nil
+	}
+	until, err := time.Parse(time.RFC3339, lockedUntil.String)
+	if err != nil {
+		return false, 0, nil
+	}
+	if remaining := time.Until(until); remaining > 0 {
+		return true, remaining, nil
+	}
+	return false, 0, nil
+}
+
+// RecordLoginFailure bumps the consecutive-failure count for identifier and, per
+// the exponential loginBackoff table, stamps how long the next attempt is locked
+// out. It returns the lockout now in force (0 while still within the free
+// attempts).
+func (s *Store) RecordLoginFailure(identifier string) (time.Duration, error) {
+	var fails int
+	err := s.db.QueryRow(
+		`SELECT fails FROM login_attempts WHERE identifier = ?`, identifier).Scan(&fails)
+	if err != nil && err != sql.ErrNoRows {
+		return 0, err
+	}
+	fails++
+	now := time.Now().UTC()
+	lockout := lockoutFor(fails)
+	var lockedUntil string
+	if lockout > 0 {
+		lockedUntil = now.Add(lockout).Format(time.RFC3339)
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO login_attempts (identifier, fails, last_attempt, locked_until)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(identifier) DO UPDATE SET
+		   fails        = excluded.fails,
+		   last_attempt = excluded.last_attempt,
+		   locked_until = excluded.locked_until`,
+		identifier, fails, now.Format(time.RFC3339), lockedUntil)
+	return lockout, err
+}
+
+// LoginFailures returns the current consecutive-failure count for identifier
+// (0 if it has no record), i.e. the running tally of failed login attempts.
+func (s *Store) LoginFailures(identifier string) (int, error) {
+	var fails int
+	err := s.db.QueryRow(
+		`SELECT fails FROM login_attempts WHERE identifier = ?`, identifier).Scan(&fails)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return fails, nil
+}
+
+// ResetLoginAttempts clears the failure/lockout state for identifier, called
+// after a successful login.
+func (s *Store) ResetLoginAttempts(identifier string) error {
+	_, err := s.db.Exec(`DELETE FROM login_attempts WHERE identifier = ?`, identifier)
 	return err
 }
 

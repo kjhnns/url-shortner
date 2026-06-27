@@ -20,7 +20,7 @@ func main() {
 	}
 	defer store.Close()
 
-	auth := NewAuth(cfg)
+	auth := NewAuth(cfg, store)
 	srv := NewServer(cfg, store, auth)
 
 	httpSrv := &http.Server{
