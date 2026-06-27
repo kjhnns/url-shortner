@@ -1,0 +1,23 @@
+{{define "claim.html"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claim /{{.Slug}}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap narrow">
+  <h1>Claim <code>/{{.Slug}}</code></h1>
+  <p class="muted">This slug is not taken yet. Point it at a URL to create the redirect.</p>
+  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+  <form method="post" action="/{{.Slug}}">
+    <label for="target_url">Redirect to</label>
+    <input id="target_url" name="target_url" type="url" inputmode="url"
+           placeholder="https://example.com/page" value="{{.Target}}" autofocus required>
+    <button type="submit">Save</button>
+  </form>
+  <p><a class="muted" href="/admin">Back to admin</a></p>
+</div>
+</body>
+</html>{{end}}

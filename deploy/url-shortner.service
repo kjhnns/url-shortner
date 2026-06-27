@@ -1,0 +1,36 @@
+# systemd unit for gojoe.run on the Hetzner box (no Docker).
+# Install at /etc/systemd/system/url-shortner.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now url-shortner
+#
+# Put the secrets in /etc/url-shortner.env (chmod 600), for example:
+#   AUTH_MODE=password
+#   APP_PASSWORD=change-me
+#   SESSION_SECRET=some-long-random-string
+#   PORT=8080
+#   DATABASE_PATH=/var/lib/url-shortner/shortener.db
+#   BASE_URL=https://gojoe.run
+
+[Unit]
+Description=gojoe.run URL shortener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=urlshort
+Group=urlshort
+EnvironmentFile=/etc/url-shortner.env
+ExecStart=/usr/local/bin/url-shortner
+WorkingDirectory=/var/lib/url-shortner
+Restart=always
+RestartSec=2
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/url-shortner
+
+[Install]
+WantedBy=multi-user.target

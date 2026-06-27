@@ -1,0 +1,11 @@
+# Caddy reverse proxy for gojoe.run with automatic HTTPS (Let's Encrypt).
+# Caddy obtains and renews the certificate on its own once gojoe.run's A/AAAA
+# records (Namecheap DNS) point at this Hetzner box.
+#
+# Install Caddy, drop this at /etc/caddy/Caddyfile, then:
+#   sudo systemctl reload caddy
+
+gojoe.run {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+}

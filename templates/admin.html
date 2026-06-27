@@ -1,0 +1,50 @@
+{{define "admin.html"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin - gojoe.run</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>Links</h1>
+    <a class="muted" href="/auth/logout">Sign out</a>
+  </div>
+
+  {{if not .Links}}
+    <p class="muted">No links yet. Visit any unclaimed <code>/&lt;slug&gt;</code> to create one.</p>
+  {{end}}
+
+  <ul class="cards">
+    {{range .Links}}
+    <li class="card">
+      <div class="card-head">
+        <a class="slug" href="/{{.Slug}}">/{{.Slug}}</a>
+        <span class="stat">{{.Clicks}} clicks</span>
+      </div>
+      <div class="target"><a href="{{.TargetURL}}" rel="noopener">{{.TargetURL}}</a></div>
+      <div class="meta muted">
+        by {{.CreatedBy}}
+        {{if .LastVisitedAt.Valid}} | last visit {{.LastVisitedAt.String}}{{end}}
+      </div>
+      <details class="edit">
+        <summary>Edit</summary>
+        <form method="post" action="/admin/update" class="inline">
+          <input type="hidden" name="slug" value="{{.Slug}}">
+          <input name="target_url" type="url" value="{{.TargetURL}}" required>
+          <button type="submit">Save</button>
+        </form>
+      </details>
+      <form method="post" action="/admin/delete" class="inline"
+            onsubmit="return confirm('Delete /{{.Slug}}?');">
+        <input type="hidden" name="slug" value="{{.Slug}}">
+        <button type="submit" class="danger">Delete</button>
+      </form>
+    </li>
+    {{end}}
+  </ul>
+</div>
+</body>
+</html>{{end}}
