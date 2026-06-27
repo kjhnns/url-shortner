@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestServer spins up a Server backed by a fresh temp SQLite DB in password
@@ -27,7 +28,7 @@ func newTestServer(t *testing.T) (*Server, http.Handler) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	auth := NewAuth(cfg)
+	auth := NewAuth(cfg, store)
 	srv := NewServer(cfg, store, auth)
 	return srv, srv.Routes()
 }
@@ -379,6 +380,161 @@ func TestAPIRootRedirectEndpoint(t *testing.T) {
 	rec = apiReq(h, http.MethodGet, "/api/settings/root_redirect", "", "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("root_redirect no token = %d, want 401", rec.Code)
+	}
+}
+
+// TestLinkClickCounter verifies the per-link open counter: each visit bumps
+// clicks (and stamps last_visited_at), and the count surfaces on the admin page.
+// RecordVisit is called directly to avoid racing the fire-and-forget goroutine
+// the redirect handler uses.
+func TestLinkClickCounter(t *testing.T) {
+	srv, h := newTestServer(t)
+	c := authedCookie(t, h)
+
+	// Claim a slug; it starts at zero clicks.
+	if rec := do(h, http.MethodPost, "/go", url.Values{"target_url": {"https://example.com"}}, c); rec.Code != http.StatusFound {
+		t.Fatalf("claim = %d, want 302", rec.Code)
+	}
+	link, _ := srv.store.GetLink("go")
+	if link.Clicks != 0 {
+		t.Fatalf("fresh link clicks = %d, want 0", link.Clicks)
+	}
+
+	// Three visits -> three clicks, and last_visited_at gets set.
+	for i := 0; i < 3; i++ {
+		if err := srv.store.RecordVisit("go"); err != nil {
+			t.Fatalf("RecordVisit: %v", err)
+		}
+	}
+	link, _ = srv.store.GetLink("go")
+	if link.Clicks != 3 {
+		t.Fatalf("clicks after 3 visits = %d, want 3", link.Clicks)
+	}
+	if !link.LastVisitedAt.Valid {
+		t.Fatal("last_visited_at not set after a visit")
+	}
+
+	// The admin page shows the count.
+	rec := do(h, http.MethodGet, "/admin", nil, c)
+	if !strings.Contains(rec.Body.String(), "3 clicks") {
+		t.Fatalf("admin page missing '3 clicks'")
+	}
+}
+
+// TestLoginThrottleLocksOutAfterRepeatedFailures verifies the exponential
+// backoff: a few free failures, then a lockout that rejects even the correct
+// password with 429 + Retry-After until it expires.
+func TestLoginThrottleLocksOutAfterRepeatedFailures(t *testing.T) {
+	_, h := newTestServer(t)
+	wrong := url.Values{"password": {"nope"}}
+
+	// First two failures are within the free window: 401, no lockout yet.
+	for i := 0; i < 2; i++ {
+		if rec := do(h, http.MethodPost, "/auth/login", wrong, nil); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d = %d, want 401", i+1, rec.Code)
+		}
+	}
+
+	// Third failure trips the exponential backoff lockout (still 401 for the bad
+	// password, but a lockout is now in force).
+	if rec := do(h, http.MethodPost, "/auth/login", wrong, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("third failure = %d, want 401", rec.Code)
+	}
+
+	// Now even the CORRECT password is rejected with 429 until the lockout ends.
+	rec := do(h, http.MethodPost, "/auth/login", url.Values{"password": {"secret"}}, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("locked-out correct password = %d, want 429", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("429 response missing Retry-After header")
+	}
+	// No session cookie should be set while locked out.
+	for _, ck := range rec.Result().Cookies() {
+		if ck.Name == sessionCookie && ck.Value != "" {
+			t.Fatal("locked-out request set a session cookie")
+		}
+	}
+}
+
+// TestLoginThrottleResetsOnSuccess verifies a successful login clears the
+// failure tally so the client starts fresh.
+func TestLoginThrottleResetsOnSuccess(t *testing.T) {
+	srv, h := newTestServer(t)
+	const id = "192.0.2.1" // httptest's default RemoteAddr host
+
+	// One failure within the free window (no lockout), counted in the store.
+	do(h, http.MethodPost, "/auth/login", url.Values{"password": {"nope"}}, nil)
+	if n, _ := srv.store.LoginFailures(id); n != 1 {
+		t.Fatalf("failures after one wrong attempt = %d, want 1", n)
+	}
+
+	// Correct password succeeds and resets the tally.
+	rec := do(h, http.MethodPost, "/auth/login", url.Values{"password": {"secret"}}, nil)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("correct password = %d, want 302", rec.Code)
+	}
+	if n, _ := srv.store.LoginFailures(id); n != 0 {
+		t.Fatalf("failures after successful login = %d, want 0 (reset)", n)
+	}
+}
+
+// TestLoginBackoffTableIsExponential pins the backoff table's shape: free
+// initial attempts, then a non-decreasing, doubling lockout that caps at the
+// final entry.
+func TestLoginBackoffTableIsExponential(t *testing.T) {
+	if lockoutFor(0) != 0 || lockoutFor(1) != 0 || lockoutFor(2) != 0 {
+		t.Fatal("the first attempts should be free (no lockout)")
+	}
+	if lockoutFor(3) != 5*time.Second {
+		t.Fatalf("lockoutFor(3) = %v, want 5s", lockoutFor(3))
+	}
+	if lockoutFor(4) != 2*lockoutFor(3) || lockoutFor(5) != 2*lockoutFor(4) {
+		t.Fatal("lockout should double each step (exponential)")
+	}
+	// Non-decreasing across the whole table.
+	for i := 2; i <= len(loginBackoff); i++ {
+		if lockoutFor(i) < lockoutFor(i-1) {
+			t.Fatalf("backoff decreased at step %d", i)
+		}
+	}
+	// Caps at the final entry for any larger count.
+	if lockoutFor(len(loginBackoff)+50) != lockoutFor(len(loginBackoff)) {
+		t.Fatal("backoff should cap at the last table entry")
+	}
+}
+
+// TestLoginAttemptStoreRecordAndReset exercises the store layer directly: three
+// failures lock the identifier out, and a reset clears it.
+func TestLoginAttemptStoreRecordAndReset(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "throttle.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	const id = "203.0.113.7"
+
+	for i := 0; i < 3; i++ {
+		if _, err := store.RecordLoginFailure(id); err != nil {
+			t.Fatalf("RecordLoginFailure: %v", err)
+		}
+	}
+	locked, remaining, err := store.LoginLocked(id)
+	if err != nil {
+		t.Fatalf("LoginLocked: %v", err)
+	}
+	if !locked || remaining <= 0 {
+		t.Fatalf("after 3 failures locked=%v remaining=%v, want locked with time left", locked, remaining)
+	}
+
+	if err := store.ResetLoginAttempts(id); err != nil {
+		t.Fatalf("ResetLoginAttempts: %v", err)
+	}
+	if locked, _, _ := store.LoginLocked(id); locked {
+		t.Fatal("identifier still locked after reset")
+	}
+	if n, _ := store.LoginFailures(id); n != 0 {
+		t.Fatalf("failures after reset = %d, want 0", n)
 	}
 }
 
